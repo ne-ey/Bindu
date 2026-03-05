@@ -54,6 +54,46 @@ async def agent_run_endpoint(app: BinduApplication, request: Request) -> Respons
 
         logger.debug(f"A2A request from {client_ip}: method={method}, id={request_id}")
 
+        # ---------------------------------------------------------------------
+        # Authentication / Authorization guard
+        # ---------------------------------------------------------------------
+        if app_settings.auth.enabled:
+            # verify middleware has attached user context (if middleware was used)
+            user_info = getattr(request.state, "user_info", None)
+            if not user_info:
+                # no authentication data, reject immediately
+                logger.warning(f"Unauthenticated request for {method} from {client_ip}")
+                from bindu.common.protocol.types import AuthenticationRequiredError
+
+                code, message = extract_error_fields(AuthenticationRequiredError)
+                return jsonrpc_error(
+                    code,
+                    message,
+                    "Authentication required for agent execution",
+                    request_id,
+                    401,
+                )
+
+            # if permission checks are enabled, ensure the token has required scope
+            if app_settings.auth.require_permissions:
+                required_scopes = app_settings.auth.permissions.get(method, [])
+                if required_scopes:
+                    token_scopes = user_info.get("scope", []) or []
+                    if not any(scope in token_scopes for scope in required_scopes):
+                        logger.warning(
+                            f"Insufficient permissions for method {method} from {client_ip}"
+                        )
+                        from bindu.common.protocol.types import InsufficientPermissionsError
+
+                        code, message = extract_error_fields(InsufficientPermissionsError)
+                        return jsonrpc_error(
+                            code,
+                            message,
+                            f"Missing required permissions: {required_scopes}",
+                            request_id,
+                            403,
+                        )
+        
         handler_name = app_settings.agent.method_handlers.get(method)
         if handler_name is None:
             logger.warning(f"Unsupported A2A method '{method}' from {client_ip}")
@@ -66,37 +106,40 @@ async def agent_run_endpoint(app: BinduApplication, request: Request) -> Respons
 
         # Pass payment details from middleware to handler if available
         # Payment context is passed through the metadata field in params
-        if hasattr(request.state, "payment_payload") and method == "message/send":
-            # Inject payment context into message metadata
-            if "params" in a2a_request and "message" in a2a_request["params"]:
-                message = a2a_request["params"]["message"]
-                if "metadata" not in message:
-                    message["metadata"] = {}
+        if method == "message/send":
+            payment_payload = getattr(request.state, "payment_payload", None)
+            payment_requirements = getattr(request.state, "payment_requirements", None)
+            verify_response = getattr(request.state, "verify_response", None)
 
-                # Add payment context to message metadata (internal use only)
-                # Serialize Pydantic models and dataclasses to dicts for JSON compatibility
-                from dataclasses import asdict, is_dataclass
+            if payment_payload and payment_requirements and verify_response:
+                if "params" in a2a_request and "message" in a2a_request["params"]:
+                    message = a2a_request["params"]["message"]
+                    message.setdefault("metadata", {})
 
-                def serialize_to_dict(obj):
-                    """Serialize Pydantic models or dataclasses to dict."""
-                    if hasattr(obj, "model_dump"):
-                        return obj.model_dump()
-                    elif is_dataclass(obj):
-                        return asdict(obj)
-                    else:
+                    from dataclasses import asdict, is_dataclass
+
+                    def serialize_to_dict(obj):
+                        if hasattr(obj, "model_dump"):
+                            return obj.model_dump()
+                        elif is_dataclass(obj):
+                            return asdict(obj)
                         return dict(obj)
 
-                message["metadata"]["_payment_context"] = {
-                    "payment_payload": serialize_to_dict(request.state.payment_payload),
-                    "payment_requirements": serialize_to_dict(
-                        request.state.payment_requirements
-                    ),
-                    "verify_response": serialize_to_dict(request.state.verify_response),
-                }
+                    message["metadata"]["_payment_context"] = {
+                        "payment_payload": serialize_to_dict(payment_payload),
+                        "payment_requirements": serialize_to_dict(payment_requirements),
+                        "verify_response": serialize_to_dict(verify_response),
+                    }
 
         jsonrpc_response = await handler(a2a_request)
 
         logger.debug(f"A2A response to {client_ip}: method={method}, id={request_id}")
+
+        # Streaming handlers return a Starlette Response directly
+        if isinstance(jsonrpc_response, Response):
+            if x402_is_requested(request):
+                jsonrpc_response = x402_add_header(jsonrpc_response)
+            return jsonrpc_response
 
         resp = Response(
             content=a2a_response_ta.dump_json(
