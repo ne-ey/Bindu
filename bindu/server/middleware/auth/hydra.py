@@ -10,7 +10,7 @@ ensuring both authorization (who they are) and payload integrity (has the reques
 
 from __future__ import annotations as _annotations
 
-import asyncio
+import hashlib
 import time
 from typing import Any
 
@@ -93,22 +93,14 @@ class HydraMiddleware(AuthMiddleware):
         This method utilizes a double-checked locking pattern to safely handle
         high-concurrency scenarios without blocking the main event loop.
         """
-        # Truncate the token for the cache key to save memory space
-        cache_key = token[:50] 
-
-        # 1. Fast Path: Lock-free read. 99% of requests will hit this and return immediately.
-        cached = self._introspection_cache.get(cache_key)
-        if cached and cached["expires_at"] > time.time():
-            return cached["data"]
-
-        # 2. Slow Path: Cache miss. Acquire a lock specifically for this token.
-        lock = self._cache_locks.setdefault(cache_key, asyncio.Lock())
-        
-        async with lock:
-            # Double-check inside the lock. Another asynchronous request might have
-            # acquired the lock just before us and populated the cache.
-            cached = self._introspection_cache.get(cache_key)
-            if cached and cached["expires_at"] > time.time():
+        # Check cache first
+        # Use full-token hash as cache key to prevent collision between
+        # two tokens that share the same first-50-char prefix.
+        cache_key = hashlib.sha256(token.encode()).hexdigest()
+        if cache_key in self._introspection_cache:
+            cached = self._introspection_cache[cache_key]
+            if cached["expires_at"] > time.time():
+                logger.debug("Token validated from cache")
                 return cached["data"]
 
             try:
